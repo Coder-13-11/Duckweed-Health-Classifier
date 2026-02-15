@@ -69,8 +69,6 @@ This project was developed with mentorship from:
 - **Dr. Ananda Bhattacharjee**, University of South Florida
 - **Dr. Sarina Ergas**, University of South Florida
 
-Special thanks to Steinbrenner High School for providing laboratory facilities and resources.
-
 ---
 
 **Note**: This is a student research project developed for the Intel International Science and Engineering Fair 2026. While functional and scientifically grounded, it represents early-stage research and should be validated further before widespread adoption.
