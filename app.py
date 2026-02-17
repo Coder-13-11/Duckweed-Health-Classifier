@@ -1,22 +1,8 @@
 """
 DUCKWEED COPPER ANALYZER - MACHINE LEARNING VERSION
 ====================================================
-
-Hybrid approach combining:
-1. Computer vision feature extraction
-2. Random Forest machine learning for prediction
-
-WITH TRAINED MODEL FROM ACTUAL EXPERIMENTAL DATA
-- Trained on YOUR actual duckweed images
-- 32 images across 5 copper concentrations (1, 2, 4, 8, 9.7 mg/L)
-- Mean Absolute Error: ~1.0 mg/L
-- R² Score: 0.794
-
 Karthikeya sai Yeruva 1*, Dr Sarina J. Ergas, Dr Ananda Bhattacharjee
-
-University of South Florida
-Steinbrenner High School
-ISEF 2026
+University of South Florida | Steinbrenner High School | ISEF 2026
 """
 
 import streamlit as st
@@ -29,7 +15,7 @@ import pickle
 import os
 
 st.set_page_config(
-    page_title="Duckweed Copper Analyzer - ML",
+    page_title="Duckweed Copper Analyzer",
     page_icon="🔬",
     layout="centered",
     initial_sidebar_state="collapsed"
@@ -37,419 +23,305 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-    h1 { font-family: 'Arial', sans-serif; font-size: 28px; font-weight: 600; color: #1f1f1f; }
-    h3 { font-family: 'Arial', sans-serif; font-size: 18px; font-weight: 500; color: #404040; }
+    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+    h1 { font-size: 26px; font-weight: 700; color: #1a1a1a; }
+    .result-box {
+        border-radius: 10px;
+        padding: 22px;
+        text-align: center;
+        margin: 16px 0;
+        color: white;
+    }
+    .result-box .val  { font-size: 38px; font-weight: 700; }
+    .result-box .lbl  { font-size: 15px; margin-top: 4px; opacity: 0.92; }
+    .result-box .sub  { font-size: 11px; margin-top: 3px; opacity: 0.75; }
 </style>
 """, unsafe_allow_html=True)
-# MACHINE LEARNING MODEL - Load trained model
+
+# ─────────────────────────────────────────────
+#  CAMERA  –  rear / front toggle via JS
+# ─────────────────────────────────────────────
+
+def camera_with_toggle():
+    facing = st.session_state.get("facing_mode", "environment")
+
+    col_lbl, col_btn = st.columns([3, 1])
+    with col_lbl:
+        cam_label = "Rear camera" if facing == "environment" else "Selfie camera"
+        st.markdown(f"**Camera** — *{cam_label} active*")
+    with col_btn:
+        if st.button("🔄 Flip camera", key="flip_cam"):
+            st.session_state["facing_mode"] = (
+                "user" if facing == "environment" else "environment"
+            )
+            st.rerun()
+
+    photo = st.camera_input("", label_visibility="collapsed", key=f"cam_{facing}")
+
+    # JS: restart the video stream with the chosen facingMode
+    st.markdown(f"""
+    <script>
+    (function() {{
+        const facing = "{facing}";
+        function flipCamera() {{
+            const videos = window.parent.document.querySelectorAll('video');
+            videos.forEach(video => {{
+                const stream = video.srcObject;
+                if (!stream) return;
+                stream.getTracks().forEach(t => t.stop());
+                navigator.mediaDevices.getUserMedia({{
+                    video: {{ facingMode: {{ ideal: facing }} }},
+                    audio: false
+                }}).then(newStream => {{
+                    video.srcObject = newStream;
+                }}).catch(console.error);
+            }});
+        }}
+        setTimeout(flipCamera, 800);
+    }})();
+    </script>
+    """, unsafe_allow_html=True)
+
+    return photo
+
+
+# ─────────────────────────────────────────────
+#  ML MODEL LOADING
+# ─────────────────────────────────────────────
+
 @st.cache_resource
 def load_ml_model():
-    """Load pre-trained Random Forest model and scaler"""
-    try:
-        model_path = 'duckweed_model.pkl'
-        scaler_path = 'duckweed_scaler.pkl'
-        if not os.path.exists(model_path):
-            model_path = '/home/claude/duckweed_model.pkl'
-            scaler_path = '/home/claude/duckweed_scaler.pkl'
-        
-        with open(model_path, 'rb') as f:
-            model = pickle.load(f)
-        
-        with open(scaler_path, 'rb') as f:
-            scaler = pickle.load(f)
-        
-        return model, scaler
-    except FileNotFoundError:
-        st.error("⚠️ Model files not found! Please run train_model.py first.")
-        st.stop()
-    except Exception as e:
-        st.error(f"Error loading model: {e}")
-        st.stop()
+    for base in [".", "/home/claude"]:
+        mp = os.path.join(base, "duckweed_model.pkl")
+        sp = os.path.join(base, "duckweed_scaler.pkl")
+        if os.path.exists(mp):
+            with open(mp, "rb") as f: model = pickle.load(f)
+            with open(sp, "rb") as f: scaler = pickle.load(f)
+            return model, scaler
+    st.error("Model files not found! Ensure duckweed_model.pkl and duckweed_scaler.pkl are present.")
+    st.stop()
 
+
+# ─────────────────────────────────────────────
+#  VISION / FEATURE EXTRACTION
+# ─────────────────────────────────────────────
 
 def detect_duckweed_only(cropped):
-    """
-    STRICT duckweed detection - only actual frond objects
-    
-    Duckweed characteristics:
-    - Small, oval/round shaped objects
-    - Dark to medium green color
-    - Size: 20-800 pixels (individual fronds)
-    - Distinct from background
-    """
     R, G, B = cv2.split(cropped)
-    potential_plant = (
-        (G > 110) &                      # Must have strong green (raised from 100)
-        (G > R + 5) &                    # Green must dominate red
-        (G > B + 35) &                   # Green much greater than blue (raised from 30)
-        (cropped.mean(axis=2) < 155) &   # Must be darker (lowered from 160)
-        (cropped.mean(axis=2) > 80)      # But not too dark (shadows)
-    )
-    kernel_small = np.ones((3, 3), np.uint8)
-    kernel_large = np.ones((5, 5), np.uint8)
-    
-    plant_mask = potential_plant.astype(np.uint8) * 255
-    plant_mask = cv2.morphologyEx(plant_mask, cv2.MORPH_OPEN, kernel_small)
-    plant_mask = cv2.morphologyEx(plant_mask, cv2.MORPH_CLOSE, kernel_large)
-    
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        plant_mask, connectivity=8
-    )
-    duckweed_mask = np.zeros_like(plant_mask)
-    
-    min_frond_size = 20     
-    max_frond_size = 800    
-    
-    valid_fronds = 0
-    for i in range(1, num_labels):  
-        area = stats[i, cv2.CC_STAT_AREA]
-        
-        if min_frond_size <= area <= max_frond_size:
-            duckweed_mask[labels == i] = 255
-            valid_fronds += 1
-    
-    return duckweed_mask, valid_fronds
+    mask = (
+        (G > 110) & (G > R + 5) & (G > B + 35) &
+        (cropped.mean(axis=2) < 155) & (cropped.mean(axis=2) > 80)
+    ).astype(np.uint8) * 255
+
+    k3, k5 = np.ones((3,3), np.uint8), np.ones((5,5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out, fronds = np.zeros_like(mask), 0
+    for i in range(1, n):
+        if 20 <= stats[i, cv2.CC_STAT_AREA] <= 800:
+            out[labels == i] = 255
+            fronds += 1
+    return out, fronds
 
 
 def extract_features(cropped, hsv):
-    """
-    Extract 10 features for machine learning model
-    USING STRICT DUCKWEED-ONLY DETECTION
-    """
     R, G, B = cv2.split(cropped)
     H, S, V = cv2.split(hsv)
-    duckweed_mask, num_fronds = detect_duckweed_only(cropped)
-    
-    coverage = 100 * np.sum(duckweed_mask > 0) / duckweed_mask.size
-    if np.sum(duckweed_mask > 0) > 0:
-        duckweed_pixels = duckweed_mask > 0
-        h_mean = H[duckweed_pixels].mean()
-        s_mean = S[duckweed_pixels].mean()
-        v_mean = V[duckweed_pixels].mean()
-        g_mean = G[duckweed_pixels].mean()
-        b_mean = B[duckweed_pixels].mean()
-        h_std = H[duckweed_pixels].std()
-        s_std = S[duckweed_pixels].std()
-        g_to_b = g_mean / (b_mean + 1)
-        brightness = cropped[duckweed_pixels].mean()
+    mask, _ = detect_duckweed_only(cropped)
+    coverage = 100 * np.sum(mask > 0) / mask.size
+
+    if np.sum(mask > 0) > 0:
+        px = mask > 0
+        h_mean, s_mean, v_mean = H[px].mean(), S[px].mean(), V[px].mean()
+        g_mean, b_mean = G[px].mean(), B[px].mean()
+        h_std, s_std = H[px].std(), S[px].std()
+        g_to_b, brightness = g_mean / (b_mean + 1), cropped[px].mean()
     else:
-        h_mean = 30
-        s_mean = 70
-        v_mean = 140
-        g_mean = 140
-        b_mean = 100
-        h_std = 5
-        s_std = 40
-        g_to_b = 1.4
-        brightness = 130
-    
-    features = [
-        coverage,      # 1. Duckweed coverage % (STRICT)
-        h_mean,        # 2. Mean hue
-        s_mean,        # 3. Mean saturation
-        v_mean,        # 4. Mean value
-        g_mean,        # 5. Green channel mean
-        b_mean,        # 6. Blue channel mean
-        h_std,         # 7. Hue standard deviation
-        s_std,         # 8. Saturation std dev
-        g_to_b,        # 9. Green to blue ratio
-        brightness     # 10. Overall brightness
-    ]
-    
-    return np.array(features), duckweed_mask
+        h_mean, s_mean, v_mean = 30, 70, 140
+        g_mean, b_mean, h_std, s_std, g_to_b, brightness = 140, 100, 5, 40, 1.4, 130
+
+    return np.array([coverage, h_mean, s_mean, v_mean,
+                     g_mean, b_mean, h_std, s_std, g_to_b, brightness]), mask
 
 
-def analyze_with_ml(image, is_control=False):
-    """
-    Analyze sample using TRAINED machine learning model
-    """
-    if image.mode == 'RGBA':
-        background = Image.new('RGB', image.size, (255, 255, 255))
-        background.paste(image, mask=image.split()[3])
-        image = background
-    elif image.mode != 'RGB':
-        image = image.convert('RGB')
-    
-    img_array = np.array(image)
-    h, w = img_array.shape[:2]
-    
-    # Crop to center 50%
-    crop_h, crop_w = int(h * 0.5), int(w * 0.5)
-    start_y, start_x = (h - crop_h) // 2, (w - crop_w) // 2
-    cropped = img_array[start_y:start_y+crop_h, start_x:start_x+crop_w]
-    
-    # Convert to HSV
+def analyze(image, is_control=False):
+    if image.mode == "RGBA":
+        bg = Image.new("RGB", image.size, (255,255,255))
+        bg.paste(image, mask=image.split()[3])
+        image = bg
+    elif image.mode != "RGB":
+        image = image.convert("RGB")
+
+    arr = np.array(image)
+    h, w = arr.shape[:2]
+    ch, cw = int(h*.5), int(w*.5)
+    sy, sx = (h-ch)//2, (w-cw)//2
+    cropped = arr[sy:sy+ch, sx:sx+cw]
     hsv = cv2.cvtColor(cropped, cv2.COLOR_RGB2HSV)
-    
-    # Extract features with STRICT detection
-    features, duckweed_mask = extract_features(cropped, hsv)
-    
-    # Load ML model
+
+    features, mask = extract_features(cropped, hsv)
     model, scaler = load_ml_model()
-    
-    # Scale features and predict
-    features_scaled = scaler.transform(features.reshape(1, -1))
-    copper_ml = model.predict(features_scaled)[0]
-    
-    # Control protection
-    if is_control:
-        copper_ml = min(copper_ml, 0.5)
-    
-    copper_ml = max(0.0, min(copper_ml, 12.0))
-    
-    # Calculate health score
-    health_score = max(0, min(100, 100 - (copper_ml / 12 * 100)))
-    
-    return {
-        'copper': copper_ml,
-        'health_score': health_score,
-        'dark_green_coverage': features[0],
-        'mean_hue': features[1],
-        'mean_saturation': features[2],
-        'features': features,
-        'cropped': cropped,
-        'dark_mask': duckweed_mask
-    }
+    copper = model.predict(scaler.transform(features.reshape(1,-1)))[0]
+    if is_control: copper = min(copper, 0.5)
+    copper = max(0.0, min(copper, 12.0))
+    health = max(0, min(100, 100 - copper/12*100))
+
+    return dict(copper=copper, health=health, coverage=features[0],
+                features=features, cropped=cropped, mask=mask)
 
 
-def get_status(copper_level):
-    if copper_level < 1.0:
-        return "Healthy/Control", "#4CAF50", "✅"
-    elif copper_level < 3.0:
-        return "Low Stress", "#8BC34A", "⚠️"
-    elif copper_level < 6.0:
-        return "Moderate Stress", "#FF9800", "⚠️"
-    elif copper_level < 9.0:
-        return "High Stress", "#FF5722", "🚨"
-    else:
-        return "Severe Toxicity", "#D32F2F", "☠️"
+def get_status(c):
+    if   c < 1.0: return "Healthy / Control",  "#43a047", "✅"
+    elif c < 3.0: return "Low Stress",          "#7cb342", "🟡"
+    elif c < 6.0: return "Moderate Stress",     "#fb8c00", "⚠️"
+    elif c < 9.0: return "High Stress",         "#e53935", "🚨"
+    else:         return "Severe Toxicity",     "#b71c1c", "☠️"
 
 
-def create_visualization(original_img, cropped, dark_mask):
-    if original_img.mode == 'RGBA':
-        background = Image.new('RGB', original_img.size, (255, 255, 255))
-        background.paste(original_img, mask=original_img.split()[3])
-        img1 = np.array(background)
-    else:
-        img1 = np.array(original_img)
-    
-    img2 = cropped.copy()
-    overlay = np.zeros_like(img2)
-    
-    indices = np.where(dark_mask > 0)
-    overlay[indices[0], indices[1]] = [0, 255, 0]
-    
-    img2_with_overlay = cv2.addWeighted(img2, 0.65, overlay, 0.35, 0)
-    
-    return Image.fromarray(img1), Image.fromarray(img2_with_overlay)
+def make_viz(original, cropped, mask):
+    img1 = np.array(original.convert("RGB"))
+    img2, ov = cropped.copy(), np.zeros_like(cropped)
+    ov[mask > 0] = [0, 255, 0]
+    img2 = cv2.addWeighted(img2, 0.65, ov, 0.35, 0)
+    return Image.fromarray(img1), Image.fromarray(img2)
 
 
-# ============================================================================
-# MAIN APP
-# ============================================================================
+# ─────────────────────────────────────────────
+#  UI
+# ─────────────────────────────────────────────
 
-st.title("Duckweed Copper Analyzer")
-st.caption("Machine Learning Biosensor for Heavy Metal Detection")
-st.caption("Karthikeya Yeruva | Steinbrenner High School | University of South Florida")
-
+st.title("🔬 Duckweed Copper Analyzer")
+st.caption("ML Biosensor · Karthikeya Yeruva · Steinbrenner HS / USF · ISEF 2026")
 st.markdown("---")
 
-st.subheader("Sample Type")
-is_control = st.checkbox("Control sample (0 mg/L copper)", 
-                         help="Check if this is an untreated control sample")
-
+is_control = st.checkbox("This is a control sample (0 mg/L copper)")
 st.markdown("---")
 
-st.subheader("Image Upload")
-col1, col2 = st.columns(2)
-with col1:
-    camera_photo = st.camera_input("Take photo")
-with col2:
-    uploaded_file = st.file_uploader("Upload image", type=['jpg', 'jpeg', 'png'])
+# ── Image input tabs ─────────────────────────
+tab_cam, tab_upload = st.tabs(["📷 Camera", "📁 Upload"])
+
+with tab_cam:
+    camera_photo = camera_with_toggle()
+
+with tab_upload:
+    uploaded_file = st.file_uploader("Choose an image", type=["jpg","jpeg","png"],
+                                     label_visibility="collapsed")
 
 image_source = camera_photo if camera_photo is not None else uploaded_file
 
+# ── Results ──────────────────────────────────
 if image_source is not None:
-    st.markdown("---")
-    st.subheader("Analysis Results")
-    
     image = Image.open(image_source)
-    
-    with st.spinner('Analyzing with trained Random Forest model...'):
-        results = analyze_with_ml(image, is_control=is_control)
-        status, color, icon = get_status(results['copper'])
-        orig_viz, overlay_viz = create_visualization(image, results['cropped'], results['dark_mask'])
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Original Sample**")
-        st.image(orig_viz, use_container_width=True)
-    with col2:
-        st.markdown("**Duckweed Detection**")
-        st.image(overlay_viz, use_container_width=True)
-        st.caption("Green = Detected duckweed fronds only")
-    
-    st.markdown("---")
-    
+
+    with st.spinner("Analyzing…"):
+        res = analyze(image, is_control)
+        status, color, icon = get_status(res["copper"])
+        orig_viz, overlay_viz = make_viz(image, res["cropped"], res["mask"])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.image(orig_viz,    caption="Original sample",            use_container_width=True)
+    with c2:
+        st.image(overlay_viz, caption="Duckweed detected (green)",  use_container_width=True)
+
     st.markdown(f"""
-    <div style="background-color: {color}; color: white; padding: 20px; border-radius: 5px; text-align: center; margin: 20px 0;">
-        <div style="font-size: 32px; font-weight: 600;">{results['copper']:.2f} mg/L</div>
-        <div style="font-size: 16px; margin-top: 5px;">{status}</div>
-        <div style="font-size: 12px; margin-top: 5px; opacity: 0.9;">Random Forest Prediction</div>
+    <div class="result-box" style="background:{color}">
+        <div class="val">{res['copper']:.2f} mg/L</div>
+        <div class="lbl">{icon}  {status}</div>
+        <div class="sub">Random Forest · trained on your experimental data</div>
     </div>
     """, unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Duckweed Coverage", f"{results['dark_green_coverage']:.1f}%",
-                 help="Only actual duckweed fronds detected")
-    with col2:
-        st.metric("Health Score", f"{results['health_score']:.0f}/100")
-    with col3:
-        st.metric("Copper Level", f"{results['copper']:.2f} mg/L")
-    
-    st.markdown("---")
-    
-    with st.expander("View ML Model Details"):
-        st.markdown("""
-        **Machine Learning Model:** Random Forest Regressor
-        - **Algorithm**: Ensemble of 150 decision trees
-        - **Training Data**: 32 YOUR actual experimental images
-          - 8 images @ 1.0 mg/L (samples 2A, 2B)
-          - 8 images @ 2.0 mg/L (samples 3A, 3B)
-          - 8 images @ 4.0 mg/L (samples 4A, 4B)
-          - 4 images @ 8.0 mg/L (sample 5A)
-          - 4 images @ 9.7 mg/L (sample 5B)
-        - **Performance**: 
-          - Mean Absolute Error: 1.0 mg/L
-          - R² Score: 0.794
-          - Cross-validation MAE: 3.4 mg/L
-        - **Features**: 10 extracted from image (color, texture, coverage)
-        
-        **Most Important Features (by model):**
-        1. Saturation Standard Deviation (34.7%)
-        2. Mean Hue (18.7%)
-        3. Coverage % (10.1%)
-        4. Mean Saturation (7.4%)
-        5. Green/Blue Ratio (6.4%)
-        
-        **STRICT Duckweed Detection:**
-        - Green channel > 110 (strong green required)
-        - Green > Red + 5 (green dominance)
-        - Green > Blue + 35 (not gray)
-        - Brightness: 80-155 (excludes overexposed and shadows)
-        - Size filter: 20-800 pixels (individual fronds only)
-        - Morphological filtering (removes noise)
-        
-        **Feature Extraction:**
-        1. Duckweed coverage % (STRICT detection)
-        2. Mean hue (color) - from duckweed only
-        3. Mean saturation - from duckweed only
-        4. Mean value (brightness) - from duckweed only
-        5. Green channel mean - from duckweed only
-        6. Blue channel mean - from duckweed only
-        7. Hue standard deviation
-        8. Saturation standard deviation
-        9. Green/Blue ratio
-        10. Overall brightness - from duckweed only
-        
-        The model learns which features are most predictive of copper toxicity
-        from YOUR actual experimental data.
-        """)
-        
-        if is_control:
-            st.info("Control mode enabled: Prediction capped at <0.5 mg/L")
-        
-        st.markdown("**Extracted Features (Current Sample):**")
-        feature_names = [
-            "Duckweed Coverage %",
-            "Mean Hue",
-            "Mean Saturation",
-            "Mean Value",
-            "Green Channel",
-            "Blue Channel",
-            "Hue Std Dev",
-            "Saturation Std Dev",
-            "G/B Ratio",
-            "Brightness"
-        ]
-        for name, value in zip(feature_names, results['features']):
-            st.text(f"{name:<25} {value:>8.2f}")
-    
-    st.markdown("**Interpretation:**")
-    if results['copper'] < 1.0:
-        st.success(f"ML model predicts minimal copper contamination (<1 mg/L).")
-    elif results['copper'] < 3.0:
-        st.info(f"ML model predicts low to moderate copper exposure ({results['copper']:.2f} mg/L).")
-    elif results['copper'] < 6.0:
-        st.warning(f"ML model predicts moderate copper stress ({results['copper']:.2f} mg/L).")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Coverage",     f"{res['coverage']:.1f}%")
+    m2.metric("Health Score", f"{res['health']:.0f}/100")
+    m3.metric("Copper",       f"{res['copper']:.2f} mg/L")
+
+    epa = 1.3
+    if res["copper"] <= epa:
+        st.success(f"✅ Below EPA drinking-water action level ({epa} mg/L)")
     else:
-        st.error(f"ML model predicts high copper toxicity ({results['copper']:.2f} mg/L).")
-    
-    epa_limit = 1.3
-    if results['copper'] <= epa_limit:
-        st.success(f"Below EPA action level of {epa_limit} mg/L for drinking water")
-    else:
-        st.warning(f"Exceeds EPA action level by {results['copper'] - epa_limit:.2f} mg/L")
-    
+        st.warning(f"⚠️ Exceeds EPA action level by {res['copper']-epa:.2f} mg/L")
+
     st.markdown("---")
-    
-    results_data = {
-        'Timestamp': [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-        'Is_Control': [is_control],
-        'ML_Prediction_mg/L': [f"{results['copper']:.2f}"],
-        'Duckweed_Coverage_%': [f"{results['dark_green_coverage']:.2f}"],
-        'Health_Score': [f"{results['health_score']:.1f}"],
-        'Status': [status]
-    }
-    
-    df = pd.DataFrame(results_data)
-    csv = df.to_csv(index=False)
-    
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.download_button(
-            "Download Results (CSV)",
-            data=csv,
-            file_name=f"ml_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
+
+    # ── Collapsible details ───────────────────
+    with st.expander("📊 Extracted image features"):
+        names = ["Coverage %","Mean Hue","Mean Saturation","Mean Value",
+                 "Green Channel","Blue Channel","Hue Std Dev",
+                 "Saturation Std Dev","G/B Ratio","Brightness"]
+        st.dataframe(
+            pd.DataFrame({"Feature": names,
+                          "Value": [f"{v:.2f}" for v in res["features"]]}),
+            hide_index=True, use_container_width=True
         )
-    with col2:
-        if st.button("New Analysis"):
+
+    with st.expander("🤖 Model & training info"):
+        st.markdown("""
+**Model:** Random Forest Regressor · 150 trees · trained on 32 experimental images
+
+| Concentration | Samples | Images |
+|---|---|---|
+| 1.0 mg/L | 2A, 2B | 8 |
+| 2.0 mg/L | 3A, 3B | 8 |
+| 4.0 mg/L | 4A, 4B | 8 |
+| 8.0 mg/L | 5A | 4 |
+| 9.7 mg/L | 5B | 4 |
+
+**Performance:** MAE 1.0 mg/L · R² 0.794
+
+**Top features learned:**
+1. Saturation Std Dev — 34.7%
+2. Mean Hue — 18.7%
+3. Coverage % — 10.1%
+        """)
+        if is_control:
+            st.info("Control mode active: prediction capped at ≤ 0.5 mg/L")
+
+    with st.expander("🔍 Detection method"):
+        st.markdown("""
+**Duckweed pixel filter (strict):**
+- Green channel > 110
+- Green > Red + 5
+- Green > Blue + 35
+- Brightness between 80 – 155
+- Connected component size: 20 – 800 px
+- Morphological open/close to remove noise
+        """)
+
+    st.markdown("---")
+    csv = pd.DataFrame({
+        "Timestamp":         [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        "Is_Control":        [is_control],
+        "ML_Prediction_mgL": [f"{res['copper']:.2f}"],
+        "Coverage_%":        [f"{res['coverage']:.2f}"],
+        "Health_Score":      [f"{res['health']:.1f}"],
+        "Status":            [status],
+    }).to_csv(index=False)
+
+    col_dl, col_new = st.columns([3,1])
+    with col_dl:
+        st.download_button("⬇️ Download result (CSV)", data=csv,
+                           file_name=f"duckweed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                           mime="text/csv")
+    with col_new:
+        if st.button("🔁 New analysis"):
             st.rerun()
 
 else:
-    st.info("Please upload or photograph a duckweed sample to begin analysis.")
-    
-    st.markdown("---")
-    st.subheader("About This Tool")
-    st.markdown("""
-    This analyzer uses **machine learning** (Random Forest) trained on YOUR
-    actual experimental data to detect copper contamination by analyzing 
-    duckweed health.
-    
-    **Training Dataset:**
-    - 32 images from your experiment
-    - 5 copper concentrations: 1, 2, 4, 8, 9.7 mg/L
-    - Days 2, 3, 4, and 7 timepoints
-    
-    **Model Performance:**
-    - Average prediction error: 1.0 mg/L
-    - R² score: 0.794 (79.4% variance explained)
-    - Cross-validation error: 3.4 mg/L
-    
-    **STRICT Duckweed Detection:**
-    - Only detects actual duckweed fronds (20-800 pixels)
-    - Filters out background, petri dish, and non-plant material
-    - Uses size, shape, and color criteria specific to duckweed
-    
-    **Advantages of This Approach:**
-    - Learns complex relationships from YOUR data
-    - More accurate than generic thresholds
-    - Trained on actual experimental conditions
-    - Can be retrained with more data to improve
-    """)
+    st.info("📸 Take a photo or upload an image to begin.")
+    with st.expander("ℹ️ About this tool"):
+        st.markdown("""
+**Duckweed Copper Analyzer** uses a Random Forest model trained on 32 images
+from your experiment to predict copper contamination from a photo alone.
+
+- **Accuracy:** ~1 mg/L average error  
+- **R²:** 0.794  
+- **Concentrations trained on:** 1, 2, 4, 8, 9.7 mg/L  
+- **No lab equipment needed** — just a smartphone camera
+        """)
 
 st.markdown("---")
-st.caption("Duckweed Copper Analyzer - ML Version | ISEF 2026 | Karthikeya Yeruva")
+st.caption("Duckweed Copper Analyzer · ML Version · ISEF 2026 · Karthikeya Yeruva")
